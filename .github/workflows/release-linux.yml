@@ -27,6 +27,10 @@ jobs:
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     container: ubuntu:22.04
+    # Inside a container `run:` defaults to sh, which has no pipefail.
+    defaults:
+      run:
+        shell: bash
     steps:
       - name: Install toolchain
         run: |
