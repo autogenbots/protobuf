@@ -1,0 +1,122 @@
+# Builds protobuf 27.2 (upstream tag v27.2, commit 63def39) for Linux and
+# publishes it as release v5.27.2: protoc 27.2 is what python's
+# protobuf==5.27.2 runtime pairs with, which is the version build scripts pin.
+#
+# Built in ubuntu:22.04 so the binaries need nothing newer than its glibc
+# (2.35), the oldest userland they have to run on. Runs only on a push to this
+# release branch.
+name: release-linux
+
+on:
+  push:
+    branches: [release-v5.27.2]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build (${{ matrix.arch }})
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    container: ubuntu:22.04
+    steps:
+      - name: Install toolchain
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential cmake git ca-certificates file pkg-config
+
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # Static, position-independent, C++17, abseil from the bundled submodule,
+      # tests off.
+      - name: Configure
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_STANDARD=17 \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DBUILD_SHARED_LIBS=OFF \
+            -Dprotobuf_BUILD_TESTS=OFF \
+            -Dprotobuf_ABSL_PROVIDER=module \
+            -DCMAKE_INSTALL_PREFIX="$PWD/stage"
+
+      - name: Build and install
+        run: |
+          cmake --build build --parallel "$(nproc)"
+          cmake --install build
+
+      - name: Package and check
+        run: |
+          set -euo pipefail
+          arch=${{ matrix.arch }}
+          mkdir -p out
+          install -m 0755 stage/bin/protoc "out/protoc-$arch"
+          strip "out/protoc-$arch"
+          cp stage/lib/libprotoc.a "out/libprotoc-$arch.a"
+          tar -czf "out/protobuf-cpp-$arch.tar.gz" -C stage include lib
+          version="$("out/protoc-$arch" --version)"
+          echo "protoc: $version"
+          test "$version" = "libprotoc 27.2"
+          echo "pkg-config protobuf: $(PKG_CONFIG_PATH="$PWD/stage/lib/pkgconfig" pkg-config --modversion protobuf)"
+          echo "newest glibc symbol: $(objdump -T "out/protoc-$arch" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)"
+          file out/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: protobuf-${{ matrix.arch }}
+          path: out/
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+
+      - name: Publish v5.27.2
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cd out
+          sha256sum protoc-* libprotoc-* protobuf-cpp-* > SHA256SUMS
+          cat > notes.md <<'EOF'
+          protobuf 27.2 (upstream tag `v27.2`, commit `63def39`), built from source for Linux by `.github/workflows/release-linux.yml` on the `release-v5.27.2` branch. The release is named for the matching python runtime, `protobuf==5.27.2`.
+
+          ## Assets
+
+          | File | Contents |
+          |---|---|
+          | `protoc-<arch>` | protoc compiler binary |
+          | `libprotoc-<arch>.a` | protoc compiler library (for protoc plugins) |
+          | `protobuf-cpp-<arch>.tar.gz` | C++ runtime: `include/` and static `lib/` for protobuf, protobuf-lite, utf8_range and abseil, plus `lib/pkgconfig` |
+
+          `<arch>` is `x86_64` or `aarch64`, each built natively in `ubuntu:22.04` (glibc 2.35) with CMake: static, position-independent, C++17, abseil bundled (`protobuf_ABSL_PROVIDER=module`), tests off.
+
+          Install the C++ runtime into `/usr/local` with `tar xzf protobuf-cpp-<arch>.tar.gz -C /usr/local`, and link with `pkg-config --cflags --libs --static protobuf`. Generated code must come from the `protoc` in this release.
+
+          ## SHA256SUMS
+
+          ```
+          EOF
+          cat SHA256SUMS >> notes.md
+          echo '```' >> notes.md
+          gh release create v5.27.2 -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title v5.27.2 --notes-file notes.md \
+            protoc-* libprotoc-* protobuf-cpp-* SHA256SUMS
